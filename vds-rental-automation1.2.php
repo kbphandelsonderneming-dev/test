@@ -184,6 +184,72 @@ function vds_mollie_get_cached_payments($force_refresh = false){
   }
   return is_array($payments) ? $payments : [];
 }
+function vds_mollie_possible_modes($preferred = null){
+  $modes = [];
+  if ($preferred && in_array($preferred, ['live','test'], true)) {
+    $modes[] = $preferred;
+  }
+
+  $current = vds_mollie_mode();
+  if ($current && in_array($current, ['live','test'], true)) {
+    $modes[] = $current;
+  }
+
+  if (!empty($modes)) {
+    $first = reset($modes);
+    $modes[] = ($first === 'live') ? 'test' : 'live';
+  } else {
+    $modes = ['live','test'];
+  }
+
+  return array_values(array_unique(array_filter($modes, function($mode){
+    return in_array($mode, ['live','test'], true);
+  })));
+}
+
+function vds_mollie_get_payment_by_id($payment_id, $mode = null){
+  $payment_id = trim((string)$payment_id);
+  if ($payment_id === '') {
+    return new WP_Error('vds_mollie_missing_payment_id', 'Geen Mollie payment id opgegeven.');
+  }
+
+  $mode = $mode ?: vds_mollie_mode();
+  $query = [];
+  if ($mode === 'test') {
+    $query['testmode'] = 'true';
+  }
+
+  $path = '/v2/payments/'.rawurlencode($payment_id);
+  if (!empty($query)) {
+    $path .= '?'.http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+  }
+
+  return vds_mollie_api_request('GET', $path, null, $mode);
+}
+
+function vds_mollie_collect_payment_ids(WC_Order $order){
+  $ids = [];
+  foreach (['_vds_mollie_payment_request_id', '_mollie_payment_id', '_mollie_order_id', '_mollie_payment_id_order_complete'] as $meta_key) {
+    $value = $order->get_meta($meta_key);
+    if (!empty($value)) {
+      $ids[] = (string)$value;
+    }
+  }
+
+  if (method_exists($order, 'get_transaction_id')) {
+    $tx = $order->get_transaction_id();
+    if (!empty($tx)) {
+      $ids[] = (string)$tx;
+    }
+  }
+
+  $ids = array_map('trim', $ids);
+  $ids = array_filter($ids, function($value){
+    return $value !== '' && stripos($value, 'ord_') !== 0;
+  });
+
+  return array_values(array_unique($ids));
+}
 
 function vds_mollie_extract_order_id($description){
   if (!$description) return 0;
@@ -191,6 +257,76 @@ function vds_mollie_extract_order_id($description){
     return (int) $m[2];
   }
   return 0;
+}
+
+function vds_mollie_sync_order(WC_Order $order, ?array $payments = null, $allow_refresh = true){
+  if (!$order) return false;
+
+  $stored_id = $order->get_meta('_vds_mollie_payment_id');
+  if (!empty($stored_id)) {
+    return true;
+  }
+
+  if ($payments !== null) {
+    if (vds_mollie_try_sync_order($order, $payments)) {
+      return true;
+    }
+  } else {
+    $cached = vds_mollie_get_cached_payments(false);
+    if (!empty($cached) && vds_mollie_try_sync_order($order, $cached)) {
+      return true;
+    }
+
+    if ($allow_refresh) {
+      $fresh = vds_mollie_get_cached_payments(true);
+      if (!empty($fresh) && vds_mollie_try_sync_order($order, $fresh)) {
+        return true;
+      }
+    }
+  }
+
+  $mode_hints = [];
+  foreach (['_vds_mollie_payment_request_mode', '_mollie_mode', '_mollie_payment_mode'] as $meta_key) {
+    $value = $order->get_meta($meta_key);
+    if ($value) {
+      $mode_hints[] = $value;
+    }
+  }
+
+  $candidate_modes = vds_mollie_possible_modes(reset($mode_hints));
+  if (count($mode_hints) > 1) {
+    foreach ($mode_hints as $hint) {
+      if (in_array($hint, ['live','test'], true)) {
+        $candidate_modes = array_merge([$hint], array_diff($candidate_modes, [$hint]));
+      }
+    }
+    $candidate_modes = array_values(array_unique($candidate_modes));
+  }
+
+  $candidate_ids = vds_mollie_collect_payment_ids($order);
+  if (empty($candidate_ids)) {
+    return false;
+  }
+
+  foreach ($candidate_ids as $payment_id) {
+    foreach ($candidate_modes as $mode) {
+      $payment = vds_mollie_get_payment_by_id($payment_id, $mode);
+      if (is_wp_error($payment) || empty($payment['id'])) {
+        continue;
+      }
+
+      if (!empty($payment['metadata']['order_id']) && (int) $payment['metadata']['order_id'] !== (int) $order->get_id()) {
+        continue;
+      }
+
+      if (strtolower($payment['status'] ?? '') === 'paid') {
+        vds_mollie_mark_order_paid_from_payment($order, $payment);
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 function vds_mollie_mark_order_paid_from_payment(WC_Order $order, array $payment){
@@ -417,7 +553,7 @@ add_action('vds_sync_mollie_payments', function(){
       continue;
     }
 
-    vds_mollie_try_sync_order($order, $payments);
+    vds_mollie_sync_order($order, $payments, false);
   }
 });
 
@@ -434,14 +570,8 @@ add_action('init', function(){
     exit;
   }
 
-  $modes = [];
   $mode_hint = isset($_GET['mode']) ? sanitize_text_field(wp_unslash($_GET['mode'])) : '';
-  if ($mode_hint && in_array($mode_hint, ['live','test'], true)) {
-    $modes[] = $mode_hint;
-  }
-  $modes[] = vds_mollie_mode();
-  $modes[] = ($modes[0] ?? '') === 'live' ? 'test' : 'live';
-  $modes = array_unique(array_filter($modes));
+  $modes = vds_mollie_possible_modes($mode_hint);
 
   $handled = false;
 
@@ -514,7 +644,7 @@ add_action('init', function(){
     }
 
     $payments = vds_mollie_get_cached_payments(true);
-    $matched  = vds_mollie_try_sync_order($order, $payments);
+    $matched  = vds_mollie_sync_order($order, $payments, false);
     wp_send_json([
       'matched' => (bool) $matched,
       'status'  => $order->get_status(),
@@ -535,33 +665,18 @@ function vds_is_paid(WC_Order $order){
   $pd = $order->get_meta('_paid_date');
   if (!empty($pd)) return true;
 	
-// 2b) Eigen Mollie synchronisatie
-  $vds_mollie_id = $order->get_meta('_vds_mollie_payment_id');
-  if (!empty($vds_mollie_id)) return true;
-
-  // 3) Gateway hints (Mollie varieert)
-  $mol_status = $order->get_meta('_mollie_payment_status');
-  if ($mol_status && strtolower($mol_status) === 'paid') return true;
-
-  // 4) Fallback: herken Mollie notitie
-  if (function_exists('wc_get_order_notes')) {
-    $notes = wc_get_order_notes(['order_id'=>$order->get_id(), 'type'=>'any', 'order'=>'DESC', 'per_page'=>5]);
-    if (is_array($notes)) {
-      foreach ($notes as $n) {
-        $txt = is_object($n) && method_exists($n,'get_content') ? $n->get_content() : (string)($n->content ?? '');
-        if ($txt && stripos($txt, 'ideal betaling') !== false && stripos($txt, 'afgerond') !== false) {
-          return true;
-        }
-      }
-    }
-  }
+// 3) Eigen Mollie synchronisatie
+  if (!empty($order->get_meta('_vds_mollie_payment_id'))) {
+    return true;
+	  }
 	
-  // 5) Live Mollie check op omschrijving "Order <id>"
-  $recent_payments = vds_mollie_get_cached_payments();
-  if (!empty($recent_payments) && vds_mollie_try_sync_order($order, $recent_payments)) {
+  if (vds_mollie_sync_order($order)) {
     return true;
   }
-
+	
+// 4) Gateway hints (legacy Mollie plugin data)
+  $mol_status = $order->get_meta('_mollie_payment_status');
+  if ($mol_status && strtolower($mol_status) === 'paid') return true;
   return false;
 }
 
@@ -643,6 +758,37 @@ function vds_clear_payment_origin_status(WC_Order $order){
   } else {
     $order->save();
   }
+}
+
+function vds_handle_gateway_payment(WC_Order $order, $previous_status = null, $note = ''){
+  if (vds_is_partner_phone($order->get_billing_phone())) {
+    return;
+  }
+
+  if ($previous_status && in_array($previous_status, ['leveren-ophalen','huur-afhalen'], true)) {
+    vds_set_last_rental_status($order, $previous_status);
+    vds_set_payment_origin_status($order, $previous_status);
+  } else {
+    $stored = vds_get_last_rental_status($order);
+    if ($stored) {
+      vds_set_payment_origin_status($order, $stored);
+    }
+  }
+
+  vds_stamp_paid($order);
+
+  if ($order->get_status() !== 'huur-betal-ontv') {
+    $order->update_status('huur-betal-ontv', $note ?: 'Automatisch gezet na betaling (VDS).');
+    return;
+  }
+
+  $rental_status = vds_resolve_rental_status($order);
+  if ($rental_status) {
+    vds_send_payment_ok($order, $rental_status);
+    vds_schedule_after_payment($order, $rental_status, true);
+  }
+
+  vds_clear_payment_origin_status($order);
 }
 
 function vds_stamp_paid(WC_Order $order){
@@ -855,30 +1001,15 @@ add_action('woocommerce_order_status_changed', function($order_id, $old, $new){
 	 // Gateways (zoals Mollie) zetten vaak de status op processing/completed.
   // Vang dat moment af en stuur het alsnog naar huur-betal-ontv zodat de flow triggert.
   if (in_array($new, ['processing','completed'], true)) {
-    if (vds_is_partner_phone($order->get_billing_phone())) return;
+    vds_log('status_processing_to_paid', [
+      'order'      => $order_id,
+      'old'        => $old,
+      'new'        => $new,
+      'current'    => $order->get_status(),
+      'is_partner' => vds_is_partner_phone($order->get_billing_phone()),
+    ]);
 
-    if (in_array($old, ['leveren-ophalen','huur-afhalen'], true)) {
-      vds_set_last_rental_status($order, $old);
-      vds_set_payment_origin_status($order, $old);
-    } else {
-      $stored = vds_get_last_rental_status($order);
-      if ($stored) {
-        vds_set_payment_origin_status($order, $stored);
-      }
-    }
-
-    vds_stamp_paid($order);
-
-    if ($order->get_status() !== 'huur-betal-ontv') {
-      $order->update_status('huur-betal-ontv', 'Automatisch gezet na gateway-betaling (VDS).');
-    } else {
-      $rental_status = vds_resolve_rental_status($order);
-      if ($rental_status) {
-        vds_send_payment_ok($order, $rental_status);
-        vds_schedule_after_payment($order, $rental_status, true);
-      }
-      vds_clear_payment_origin_status($order);
-    }
+    vds_handle_gateway_payment($order, $old, 'Automatisch gezet na gateway-betaling (VDS).');
     return;
   }
 
@@ -957,34 +1088,7 @@ add_action('woocommerce_payment_complete', function($order_id){
     'is_partner' => vds_is_partner_phone($order->get_billing_phone()),
   ]);
 
-  if (vds_is_partner_phone($order->get_billing_phone())) return;
-
-	$current_status = $order->get_status();
-  if (in_array($current_status, ['leveren-ophalen','huur-afhalen'], true)) {
-    vds_set_last_rental_status($order, $current_status);
-    vds_set_payment_origin_status($order, $current_status);
-  } else {
-    $stored = vds_get_last_rental_status($order);
-    if ($stored) {
-      vds_set_payment_origin_status($order, $stored);
-    }
-  }
-	
-  // Zet status op huur-betal-ontv zodat de status-hook de flow start
-  if ($order->get_status() !== 'huur-betal-ontv') {
-    vds_stamp_paid($order);
-    $order->update_status('huur-betal-ontv', 'Automatisch gezet na betaling (VDS).');
-    return;
-  }
-
-  // Als hij al op huur-betal-ontv stond, verzeker alsnog dat de flow draait
-  $rental_status = vds_resolve_rental_status($order);
-  if ($rental_status) {
-    vds_stamp_paid($order);
-    vds_send_payment_ok($order, $rental_status);
-    vds_schedule_after_payment($order, $rental_status, true);
-  }
-	vds_clear_payment_origin_status($order);
+    vds_handle_gateway_payment($order, $order->get_status(), 'Automatisch gezet na betaling (VDS).');
 }, 10, 1);
 
 // Worker voor geplande WhatsApps – skip als doelmoment te ver in het verleden ligt
