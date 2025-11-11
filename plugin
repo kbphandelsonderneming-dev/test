@@ -303,7 +303,7 @@ add_action('woocommerce_order_status_changed', function($order_id, $old, $new){
 // 2) Gateway route: zodra Woo betaling complete meldt
 add_action('woocommerce_payment_complete', function($order_id){
   $order = wc_get_order($order_id);
-  if (!$order) return;
+   if (!$order) return;
 
   vds_log('payment_complete', [
     'order' => $order_id,
@@ -329,8 +329,22 @@ add_action('woocommerce_payment_complete', function($order_id){
 
 // Worker voor geplande WhatsApps – skip als doelmoment te ver in het verleden ligt
 add_action('vds_job_whatsapp', function($args){
+add_action('vds_job_whatsapp', function($arg1 = null, $arg2 = null, $arg3 = null){
+  // Action Scheduler levert de argumenten niet als één array aan maar als losse parameters.
+  // Houd een fallback voor eventuele handmatige aanroepen met één array-argument.
+  if (is_array($arg1) && $arg2 === null && $arg3 === null) {
+    $args = $arg1;
+  } else {
+    $args = [
+      'order_id' => $arg1,
+      'topic'    => $arg2,
+      'when_ts'  => $arg3,
+    ];
+  }
+
   $order_id = isset($args['order_id']) ? (int)$args['order_id'] : 0;
   $topic    = $args['topic'] ?? '';
+  $topic    = isset($args['topic']) ? (string)$args['topic'] : '';
   $when_ts  = isset($args['when_ts']) ? (int)$args['when_ts'] : 0;
 
   $order = wc_get_order($order_id);
@@ -344,6 +358,7 @@ add_action('vds_job_whatsapp', function($args){
 
   vds_zap($topic, $order, ['when_ts'=>$when_ts]);
 }, 10, 1);
+}, 10, 3);
 
 /* ==== Payment permissies voor custom statussen (betaalpagina mag bij rental) ==== */
 add_filter('woocommerce_valid_order_statuses_for_payment', function($st, $order){
@@ -435,3 +450,4 @@ add_action('init', function () {
   vds_zap($topic, $order, ['debug' => true]);
   wp_die('Sent '.$topic.' for order '.$order_id);
 });
+
