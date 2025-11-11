@@ -143,6 +143,110 @@ function vds_lock_once(WC_Order $order, $key){
   return true;
 }
 
+function vds_set_last_rental_status(WC_Order $order, $status){
+  if (!in_array($status, ['leveren-ophalen','huur-afhalen'], true)) return;
+  if ($order->get_meta('_vds_last_rental_status') === $status) return;
+  $order->update_meta_data('_vds_last_rental_status', $status);
+  if (method_exists($order, 'save_meta_data')) {
+    $order->save_meta_data();
+  } else {
+    $order->save();
+  }
+}
+
+function vds_get_last_rental_status(WC_Order $order){
+  $status = $order->get_meta('_vds_last_rental_status');
+  return in_array($status, ['leveren-ophalen','huur-afhalen'], true) ? $status : null;
+}
+
+function vds_stamp_paid(WC_Order $order){
+  $needs_save = false;
+
+  $has_paid_dt = false;
+  if (method_exists($order, 'get_date_paid')) {
+    $has_paid_dt = (bool) $order->get_date_paid('edit');
+  }
+
+  if (!$has_paid_dt && method_exists($order, 'set_date_paid') && class_exists('WC_DateTime')) {
+    $paid_dt = new WC_DateTime();
+    $paid_dt->setTimestamp(current_time('timestamp', true));
+    $order->set_date_paid($paid_dt);
+    $needs_save = true;
+  }
+
+  if (!$order->get_meta('_paid_date')) {
+    $order->update_meta_data('_paid_date', current_time('mysql'));
+    $needs_save = true;
+  }
+
+  if ($needs_save) {
+    $order->save();
+  }
+}
+
+function vds_resolve_rental_status(WC_Order $order, $status_override = null){
+  $statuses = ['leveren-ophalen','huur-afhalen'];
+  if ($status_override && in_array($status_override, $statuses, true)) {
+    return $status_override;
+  }
+
+  $current = $order->get_status();
+  if (in_array($current, $statuses, true)) {
+    return $current;
+  }
+
+  $stored = vds_get_last_rental_status($order);
+  if ($stored) {
+    return $stored;
+  }
+
+  $shipping_strings = [];
+
+  $method = $order->get_shipping_method();
+  if (!empty($method)) {
+    $shipping_strings[] = strtolower((string)$method);
+  }
+
+  if (is_callable([$order, 'get_shipping_methods'])) {
+    foreach ($order->get_shipping_methods() as $shipping_item) {
+      if (is_object($shipping_item)) {
+        if (method_exists($shipping_item, 'get_method_id')) {
+          $shipping_strings[] = strtolower((string)$shipping_item->get_method_id());
+        }
+        if (method_exists($shipping_item, 'get_method_title')) {
+          $shipping_strings[] = strtolower((string)$shipping_item->get_method_title());
+        }
+        if (method_exists($shipping_item, 'get_name')) {
+          $shipping_strings[] = strtolower((string)$shipping_item->get_name());
+        }
+      } elseif (is_array($shipping_item)) {
+        foreach (['method_id','method_title','name'] as $key) {
+          if (!empty($shipping_item[$key])) {
+            $shipping_strings[] = strtolower((string)$shipping_item[$key]);
+          }
+        }
+      }
+    }
+  }
+
+  foreach ($shipping_strings as $needle) {
+    if ($needle === '') continue;
+    if (strpos($needle, 'pickup') !== false || strpos($needle, 'afhaal') !== false) {
+      return 'huur-afhalen';
+    }
+    if (strpos($needle, 'lever') !== false || strpos($needle, 'bezorg') !== false || strpos($needle, 'delivery') !== false) {
+      return 'leveren-ophalen';
+    }
+  }
+
+  $has_shipping_address = trim((string)$order->get_shipping_address_1().' '.(string)$order->get_shipping_postcode().' '.(string)$order->get_shipping_city()) !== '';
+  if (!$has_shipping_address) {
+    return 'huur-afhalen';
+  }
+
+  return 'leveren-ophalen';
+}
+
 // Eén dispatcher naar Zapier (WhatsApp/Trustpilot/etc.)
 function vds_zap($topic, WC_Order $order, array $extra=[]){
   // Partner uitsluiten
@@ -194,10 +298,13 @@ function vds_ts_nl($dateYmd, $timeHms){
 }
 
 // Verstuur 1x "betaling ontvangen" WhatsApp, afhankelijk van huidige status
-function vds_send_payment_ok(WC_Order $order){
+function vds_send_payment_ok(WC_Order $order, $status_override = null){
   if (vds_is_partner_phone($order->get_billing_phone())) return;
 
-  $status = $order->get_status();
+  $status = vds_resolve_rental_status($order, $status_override);
+  if (!$status) return;
+
+  vds_set_last_rental_status($order, $status);
   if ($status === 'leveren-ophalen') {
     if (!vds_lock_once($order, 'payment_ok_delivery')) return;
     vds_zap('whatsapp.payment_ok_delivery', $order);
@@ -208,15 +315,17 @@ function vds_send_payment_ok(WC_Order $order){
 }
 
 // Plan WhatsApp-berichten obv status + huurdatum (alleen met lock en toekomst-check)
-function vds_schedule_after_payment(WC_Order $order){
-  // Betaalcheck: alleen plannen als betaald
-  if (!vds_is_paid($order)) return;
+function vds_schedule_after_payment(WC_Order $order, $status_override = null, $force = false){
+  // Betaalcheck: alleen plannen als betaald (tenzij geforceerd via status-trigger)
+  if (!$force && !vds_is_paid($order)) return;
 
   $rental = vds_get_rental_date_from_order($order);
   if (empty($rental['iso'])) return;
 
-  $status = $order->get_status();
-  if (!in_array($status, ['leveren-ophalen','huur-afhalen'], true)) return;
+  $status = vds_resolve_rental_status($order, $status_override);
+  if (!$status) return;
+
+  vds_set_last_rental_status($order, $status);
 
   // Lock: schedules maar 1x zetten
   if (!vds_lock_once($order, 'schedule_set')) return;
@@ -266,9 +375,10 @@ add_action('woocommerce_order_status_changed', function($order_id, $old, $new){
 
   // A) Naar verhuurstatus: alleen NA betaling -> payment-ok + planning
   if (in_array($new, ['leveren-ophalen','huur-afhalen'], true)) {
+    vds_set_last_rental_status($order, $new);
     if (vds_is_paid($order)) {
-      vds_send_payment_ok($order);
-      vds_schedule_after_payment($order);
+      vds_send_payment_ok($order, $new);
+      vds_schedule_after_payment($order, $new);
     }
     return;
   }
@@ -284,17 +394,25 @@ add_action('woocommerce_order_status_changed', function($order_id, $old, $new){
     return;
   }
 
-  // C) Handmatige betaalstatus: als we UIT een verhuurstatus komen -> altijd sturen/plannen (zonder betaalcheck)
+  // C) Handmatige betaalstatus: activeer flows op basis van laatste verhuurstatus (zonder betaalcheck)
   if ($new === 'huur-betalingen-ontvangen') {
+    $rental_status = null;
     if (in_array($old, ['leveren-ophalen','huur-afhalen'], true)) {
-      vds_send_payment_ok($order);
-      vds_schedule_after_payment($order);
+      $rental_status = $old;
+    } else {
+      $rental_status = vds_get_last_rental_status($order);
+    }
 
-      // (optioneel) meta-stempel zodat backend/payment-links consistent zijn
-      if (empty($order->get_date_paid()) && !$order->get_meta('_paid_date')) {
-        $order->update_meta_data('_paid_date', current_time('mysql'));
-        $order->save();
-      }
+    if (!$rental_status) {
+      $rental_status = vds_resolve_rental_status($order);
+    }
+
+    if ($rental_status) {
+      // Betaalstempel zetten zodat WooCommerce de betaling herkent
+      vds_stamp_paid($order);
+
+      vds_send_payment_ok($order, $rental_status);
+      vds_schedule_after_payment($order, $rental_status, true);
     }
     return;
   }
@@ -314,21 +432,23 @@ add_action('woocommerce_payment_complete', function($order_id){
 
   if (vds_is_partner_phone($order->get_billing_phone())) return;
 
-  // Staat de order al op verhuurstatus? -> payment-ok + planning
-  if (in_array($order->get_status(), ['leveren-ophalen','huur-afhalen'], true)) {
-    vds_send_payment_ok($order);
-    vds_schedule_after_payment($order);
+  // Zet status op huur-betalingen-ontvangen zodat de status-hook de flow start
+  if ($order->get_status() !== 'huur-betalingen-ontvangen') {
+    vds_stamp_paid($order);
+    $order->update_status('huur-betalingen-ontvangen', 'Automatisch gezet na betaling (VDS).');
+    return;
   }
 
-  // (optioneel) naar handmatige betaalstatus zetten voor consistentie/filters
-  $rental = vds_get_rental_date_from_order($order);
-  if ($rental['iso'] && $order->get_status() !== 'huur-betalingen-ontvangen') {
-    $order->update_status('huur-betalingen-ontvangen', 'Automatisch gezet na betaling (VDS).');
+  // Als hij al op huur-betalingen-ontvangen stond, verzeker alsnog dat de flow draait
+  $rental_status = vds_resolve_rental_status($order);
+  if ($rental_status) {
+    vds_stamp_paid($order);
+    vds_send_payment_ok($order, $rental_status);
+    vds_schedule_after_payment($order, $rental_status, true);
   }
 }, 10, 1);
 
 // Worker voor geplande WhatsApps – skip als doelmoment te ver in het verleden ligt
-add_action('vds_job_whatsapp', function($args){
 add_action('vds_job_whatsapp', function($arg1 = null, $arg2 = null, $arg3 = null){
   // Action Scheduler levert de argumenten niet als één array aan maar als losse parameters.
   // Houd een fallback voor eventuele handmatige aanroepen met één array-argument.
@@ -343,7 +463,6 @@ add_action('vds_job_whatsapp', function($arg1 = null, $arg2 = null, $arg3 = null
   }
 
   $order_id = isset($args['order_id']) ? (int)$args['order_id'] : 0;
-  $topic    = $args['topic'] ?? '';
   $topic    = isset($args['topic']) ? (string)$args['topic'] : '';
   $when_ts  = isset($args['when_ts']) ? (int)$args['when_ts'] : 0;
 
@@ -357,7 +476,6 @@ add_action('vds_job_whatsapp', function($arg1 = null, $arg2 = null, $arg3 = null
   if (!vds_lock_once($order, 'scheduled_'.$topic)) return;
 
   vds_zap($topic, $order, ['when_ts'=>$when_ts]);
-}, 10, 1);
 }, 10, 3);
 
 /* ==== Payment permissies voor custom statussen (betaalpagina mag bij rental) ==== */
@@ -450,4 +568,3 @@ add_action('init', function () {
   vds_zap($topic, $order, ['debug' => true]);
   wp_die('Sent '.$topic.' for order '.$order_id);
 });
-
