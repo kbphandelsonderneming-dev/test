@@ -681,6 +681,18 @@ function vds_is_paid(WC_Order $order){
 }
 
 // Huurdatum uit item-meta van product 3173 (of variatie-parent)
+function vds_order_contains_rental(WC_Order $order){
+  foreach ($order->get_items() as $item){
+    $prod   = is_callable([$item,'get_product']) ? $item->get_product() : null;
+    $pid    = method_exists($item,'get_product_id') ? (int)$item->get_product_id() : ($prod ? (int)$prod->get_id() : 0);
+    $parent = ($prod && method_exists($prod,'get_parent_id')) ? (int)$prod->get_parent_id() : 0;
+    if ($pid === VDS_RENTAL_PRODUCT_ID || $parent === VDS_RENTAL_PRODUCT_ID) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function vds_get_rental_date_from_order(WC_Order $order){
   foreach ($order->get_items() as $item){
     $prod   = is_callable([$item,'get_product']) ? $item->get_product() : null;
@@ -765,6 +777,14 @@ function vds_handle_gateway_payment(WC_Order $order, $previous_status = null, $n
     return;
   }
 
+	if (!vds_order_contains_rental($order)) {
+    vds_log('gateway_payment_skip_non_rental', [
+      'order' => $order->get_id(),
+      'previous_status' => $previous_status,
+    ]);
+    return;
+  }
+	
   if ($previous_status && in_array($previous_status, ['leveren-ophalen','huur-afhalen'], true)) {
     vds_set_last_rental_status($order, $previous_status);
     vds_set_payment_origin_status($order, $previous_status);
@@ -817,6 +837,10 @@ function vds_stamp_paid(WC_Order $order){
 }
 
 function vds_resolve_rental_status(WC_Order $order, $status_override = null){
+	if (!vds_order_contains_rental($order)) {
+    return null;
+  }
+	
   $statuses = ['leveren-ophalen','huur-afhalen'];
   if ($status_override && in_array($status_override, $statuses, true)) {
     return $status_override;
@@ -972,7 +996,7 @@ function vds_schedule_after_payment(WC_Order $order, $status_override = null, $f
 
   if ($status === 'leveren-ophalen') {
     $install_ts   = vds_ts_nl($iso, '07:17:00'); // dag zelf
-    $materials_ts = vds_ts_nl($iso, '07:18:00'); // direct daarna
+    $materials_ts = vds_ts_nl($iso, '07:19:00'); // direct daarna
     if ($install_ts && $install_ts > $now)    as_schedule_single_action($install_ts,   'vds_job_whatsapp', ['order_id'=>$order->get_id(),'topic'=>'whatsapp.install_success','when_ts'=>$install_ts]);
     if ($materials_ts && $materials_ts > $now)as_schedule_single_action($materials_ts, 'vds_job_whatsapp', ['order_id'=>$order->get_id(),'topic'=>'whatsapp.materials_check','when_ts'=>$materials_ts]);
   } else { // huur-afhalen
@@ -1026,6 +1050,15 @@ add_action('woocommerce_order_status_changed', function($order_id, $old, $new){
   // Partner uitsluiten
   if (vds_is_partner_phone($order->get_billing_phone())) return;
 
+if (!vds_order_contains_rental($order)) {
+    vds_log('status_skip_non_rental', [
+      'order' => $order_id,
+      'old'   => $old,
+      'new'   => $new,
+    ]);
+    return;
+  }	
+	
   // A) Naar verhuurstatus: alleen NA betaling -> payment-ok + planning
   if (in_array($new, ['leveren-ophalen','huur-afhalen'], true)) {
     vds_set_last_rental_status($order, $new);
@@ -1049,7 +1082,16 @@ add_action('woocommerce_order_status_changed', function($order_id, $old, $new){
 
   // C) Handmatige betaalstatus: activeer flows op basis van laatste verhuurstatus (zonder betaalcheck)
   if ($new === 'huur-betal-ontv') {
-    $rental_status = null;
+   if (!vds_order_contains_rental($order)) {
+      vds_log('manual_paid_skip_non_rental', [
+        'order' => $order_id,
+        'old'   => $old,
+        'new'   => $new,
+      ]);
+      return;
+    }
+	  
+	  $rental_status = null;
     if (in_array($old, ['leveren-ophalen','huur-afhalen'], true)) {
       $rental_status = $old;
     } else {
