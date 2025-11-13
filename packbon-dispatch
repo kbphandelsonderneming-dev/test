@@ -1,0 +1,621 @@
+<?php
+/**
+ * Plugin Name: VDS Packbon Dispatch (MU)
+ * Description: Verpakken & Verzending (rechter sidebar) + webhook (topic/locks) + server-side PDF proxy. Genereert/refresh pakbon en stuurt downloadlinks mee (proxy + WC REST).
+ * Author: Vechtdal Schroeffunderingen
+ * Version: 2.3.0
+ */
+
+if (!defined('ABSPATH')) exit;
+
+/* === HPOS compat === */
+add_action('before_woocommerce_init', function() {
+  if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+    \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+  }
+});
+
+/* === CONFIG === */
+define('VDS_WEBHOOK_DISPATCH', 'https://hooks.zapier.com/hooks/catch/21508957/u8ulnob/');
+
+// WooCommerce REST API keys (Read/Write)
+if (!defined('VDS_WC_CK')) define('VDS_WC_CK', 'ck_d2935b8890db330d5193cd4079d2629c6972e154');
+if (!defined('VDS_WC_CS')) define('VDS_WC_CS', 'cs_c7abeecb6d815301c4383312b16f6b977b2721dc');
+
+// Lange random secret voor HMAC (linkbeveiliging proxy)
+if (!defined('VDS_PDF_SECRET')) define('VDS_PDF_SECRET', 'ekjf4o8u5dji392ursjddf239034us0');
+
+if (!defined('VDS_DISPATCH_DEBUG')) define('VDS_DISPATCH_DEBUG', true);
+
+define('VDS_LOCK_ALL',      '[VDS-LOCK:ALL]');
+define('VDS_LOCK_INPAKKER', '[VDS-LOCK:INPAKKER]');
+define('VDS_LOCK_TGV',      '[VDS-LOCK:TGV]');
+define('VDS_DEFAULT_PICKUP_WINDOW', '15:30 - 16:30');
+define('VDS_DEFAULT_DELIVERY_LABEL', 'Zo snel mogelijk');
+
+/* === Verpakkingsopties === */
+function vds_packaging_options() {
+  return [
+    'kliko'               => 'kliko',
+    'halve_pallet'        => 'halve pallet',
+    'pallet_120x80'       => 'pallet (max 120x80cm)',
+    'bok_200x65x45'       => 'bok 200x65x45cm',
+    'bok_120x90x120'      => 'bok 120x90x120cm',
+    'bok_120x100x120'     => 'bok 120x100x120cm',
+    'bok_150x120x120'     => 'bok 150x120x120',
+    'bok_200x120x120'     => 'bok 200x120x120',
+    'anders'              => 'anders (vrij invoer)',
+  ];
+}
+
+/* === Datumopties komende 14 dagen === */
+function vds_delivery_date_options() {
+  $opts = [
+    ['value' => 'ASAP', 'label' => VDS_DEFAULT_DELIVERY_LABEL],
+  ];
+  $ts = current_time('timestamp');
+  for ($i = 0; $i <= 14; $i++) {
+    $t   = strtotime("+$i day", $ts);
+    $val = date('Y-m-d', $t);
+    $label = date_i18n('D d-m-Y', $t);
+    $opts[] = ['value' => $val, 'label' => $label];
+  }
+  return $opts;
+}
+
+/* === Sidebar metabox === */
+add_action('add_meta_boxes_shop_order', function() {
+  add_meta_box(
+    'vds_packbon_box',
+    'Verpakken & Verzending',
+    'vds_packbon_box_render',
+    'shop_order',
+    'side',
+    'high'
+  );
+}, 20);
+
+function vds_packbon_box_render(WP_Post $post) {
+  $order_id = $post->ID;
+  $order    = wc_get_order($order_id);
+  if (!$order) { echo '<p>Order niet gevonden.</p>'; return; }
+
+  $type    = get_post_meta($order_id, '_vds_packaging_type',   true);
+  $qty     = get_post_meta($order_id, '_vds_packaging_qty',    true);
+  $other   = get_post_meta($order_id, '_vds_packaging_other',  true);
+  $pickup  = get_post_meta($order_id, '_vds_pickup_window',    true);
+  $deliver = get_post_meta($order_id, '_vds_delivery_date',    true);
+  $note_p  = get_post_meta($order_id, '_vds_note_inpakker',    true);
+  $note_t  = get_post_meta($order_id, '_vds_note_tgv',         true);
+  $send_p  = (bool) get_post_meta($order_id, '_vds_send_inpakker', true);
+  $send_t  = (bool) get_post_meta($order_id, '_vds_send_tgv',      true);
+
+  // Gewicht
+  $auto_weight       = vds_calc_total_weight_kg($order);
+  $weight_override   = get_post_meta($order_id, '_vds_weight_override', true);
+  $weight_unlocked   = (bool) get_post_meta($order_id, '_vds_weight_unlocked', true);
+  $effective_weight  = ($weight_override !== '' && $weight_override !== null)
+                        ? floatval($weight_override)
+                        : $auto_weight;
+
+  if (!$qty)     $qty    = 1;
+  if (!$pickup)  $pickup = VDS_DEFAULT_PICKUP_WINDOW;
+  if (!$deliver) $deliver = 'ASAP';
+
+  $lock_all = vds_order_has_lock($order, 'all');
+  $lock_p   = vds_order_has_lock($order, 'inpakker');
+  $lock_t   = vds_order_has_lock($order, 'tgv');
+
+  // NEW: carrier label / pickup logica
+  $carrier_override = get_post_meta($order_id, '_vds_carrier_label', true);
+  $is_pickup        = vds_is_pickup_order($order); // afhalen Hardenberg of geen methode
+
+  $carrier_label = $carrier_override !== ''
+    ? $carrier_override
+    : ($is_pickup ? 'Wordt afgehaald door klant' : 'TGV');
+
+  $carrier_input = $carrier_override !== '' ? $carrier_override : $carrier_label;
+
+  wp_nonce_field('vds_packaging_nonce', 'vds_packaging_nonce');
+
+  echo '<div style="display:flex;flex-direction:column;gap:8px;">';
+
+  echo '<label><strong>Verpakking</strong><br><select name="vds_packaging_type" style="width:100%;">';
+  foreach (vds_packaging_options() as $k => $label) {
+    printf('<option value="%s" %s>%s</option>', esc_attr($k), selected($type, $k, false), esc_html($label));
+  }
+  echo '</select></label>';
+
+  printf('<label><strong>Aantal colli</strong><br><input type="number" min="1" name="vds_packaging_qty" value="%s" style="width:100%%;"></label>', esc_attr($qty));
+
+  // Gewicht met "slotje"
+  $input_id  = 'vds_total_weight_' . $order_id;
+  $btn_id    = 'vds_weight_lock_btn_' . $order_id;
+  $hidden_id = 'vds_weight_unlocked_' . $order_id;
+
+  echo '<label><strong>Totaalgewicht (kg)</strong><br>';
+  echo '<div style="display:flex;align-items:center;gap:4px;">';
+  printf(
+    '<input type="number" step="0.01" id="%s" name="vds_total_weight" value="%s" style="width:80%%;" %s />',
+    esc_attr($input_id),
+    esc_attr($effective_weight),
+    $weight_unlocked ? '' : 'readonly'
+  );
+  printf(
+    '<button type="button" class="button" id="%s" title="Klik om gewicht te ontgrendelen/vergrendelen">🔒</button>',
+    esc_attr($btn_id)
+  );
+  echo '</div>';
+  echo '<small>Standaard automatisch berekend. Klik op het slot om het gewicht handmatig aan te passen.</small>';
+  printf(
+    '<input type="hidden" id="%s" name="vds_weight_unlocked" value="%s" />',
+    esc_attr($hidden_id),
+    $weight_unlocked ? '1' : '0'
+  );
+  echo '</label>';
+
+  // Kleine inline JS om het slotje te laten werken
+  ?>
+  <script>
+  (function(){
+    var input  = document.getElementById('<?php echo esc_js($input_id); ?>');
+    var btn    = document.getElementById('<?php echo esc_js($btn_id); ?>');
+    var hidden = document.getElementById('<?php echo esc_js($hidden_id); ?>');
+    if (!input || !btn || !hidden) return;
+
+    function refresh(){
+      var unlocked = hidden.value === '1';
+      input.readOnly = !unlocked;
+      btn.textContent = unlocked ? '🔓' : '🔒';
+    }
+
+    btn.addEventListener('click', function(e){
+      e.preventDefault();
+      hidden.value = (hidden.value === '1') ? '0' : '1';
+      refresh();
+    });
+
+    refresh();
+  })();
+  </script>
+  <?php
+
+  printf('<label><strong>Anders (alleen bij "anders")</strong><br><input type="text" name="vds_packaging_other" value="%s" style="width:100%%;" placeholder="bijv. kratten 60x40"></label>', esc_attr($other));
+
+  // NEW: toon vervoer boven "Extra opties"
+  echo '<p style="margin:4px 0 0;"><strong>Vervoer:</strong> '.esc_html($carrier_label).'</p>';
+
+  echo '<details><summary style="cursor:pointer;user-select:none;"><strong>Extra opties</strong></summary>';
+  echo '<div style="margin-top:8px;display:flex;flex-direction:column;gap:8px;">';
+
+  printf('<label><strong>Ophaalvenster</strong><br><input type="text" name="vds_pickup_window" value="%s" style="width:100%%;" placeholder="bijv. 15:30 - 16:30"></label>', esc_attr($pickup));
+
+  echo '<label><strong>Afleverdatum</strong><br><select name="vds_delivery_date" style="width:100%;">';
+  foreach (vds_delivery_date_options() as $opt) {
+    printf('<option value="%s" %s>%s</option>',
+      esc_attr($opt['value']),
+      selected($deliver, $opt['value'], false),
+      esc_html($opt['label'])
+    );
+  }
+  echo '</select></label>';
+
+  // NEW: vervoer label aanpasbaar onder extra opties
+  printf('<label><strong>Vervoer label</strong><br><input type="text" name="vds_carrier_label" value="%s" style="width:100%%;" placeholder="bijv. TGV of Wordt afgehaald door klant"></label>', esc_attr($carrier_input));
+
+  printf('<label><strong>Notitie inpakker</strong><br><textarea name="vds_note_inpakker" rows="2" style="width:100%%;">%s</textarea></label>', esc_textarea($note_p));
+  printf('<label><strong>Notitie TGV</strong><br><textarea name="vds_note_tgv" rows="2" style="width:100%%;">%s</textarea></label>', esc_textarea($note_t));
+
+  echo '</div></details>';
+
+  echo '<label style="margin-top:4px;"><input type="checkbox" name="vds_send_inpakker" value="1" '.checked($send_p, true, false).'> Verstuur naar <strong>inpakker</strong>';
+  if ($lock_all || $lock_p) echo ' <span style="color:#b91c1c;font-weight:600;">(LOCK)</span>';
+  echo '</label>';
+
+  // NEW: TGV uitgeschakeld bij afhalen
+  $tgv_disabled_attr = $is_pickup ? 'disabled="disabled"' : '';
+
+  echo '<label><input type="checkbox" name="vds_send_tgv" value="1" '
+      .checked($send_t && !$is_pickup, true, false).' '.$tgv_disabled_attr.'> Verstuur naar <strong>TGV</strong>';
+  if ($lock_all || $lock_t) echo ' <span style="color:#b91c1c;font-weight:600;">(LOCK)</span>';
+  echo '</label>';
+
+  if ($is_pickup) {
+    echo '<small style="color:#b91c1c;display:block;margin-top:4px;">Afhalen in Hardenberg of geen verzendmethode: verzenden via TGV niet van toepassing.</small>';
+  }
+
+  echo '<small>Lock verwijderen? verwijder notitie '.esc_html(VDS_LOCK_INPAKKER).', '.esc_html(VDS_LOCK_TGV).' of '.esc_html(VDS_LOCK_ALL).'.</small>';
+  echo '</div>';
+}
+
+/* === Opslaan + versturen === */
+add_action('woocommerce_process_shop_order_meta', function ($order_id) {
+  if (!isset($_POST['vds_packaging_nonce']) || !wp_verify_nonce($_POST['vds_packaging_nonce'], 'vds_packaging_nonce')) return;
+
+  $type    = sanitize_text_field($_POST['vds_packaging_type'] ?? '');
+  $qty     = max(1, (int)($_POST['vds_packaging_qty'] ?? 1));
+  $other   = sanitize_text_field($_POST['vds_packaging_other'] ?? '');
+  $pickup  = sanitize_text_field($_POST['vds_pickup_window'] ?? '');
+  $deliver = sanitize_text_field($_POST['vds_delivery_date'] ?? 'ASAP');
+  $note_p  = sanitize_textarea_field($_POST['vds_note_inpakker'] ?? '');
+  $note_t  = sanitize_textarea_field($_POST['vds_note_tgv'] ?? '');
+  $send_p  = !empty($_POST['vds_send_inpakker']);
+  $send_t  = !empty($_POST['vds_send_tgv']);
+
+  // NEW: vervoer label uit formulier
+  $carrier_label_input = sanitize_text_field($_POST['vds_carrier_label'] ?? '');
+
+  // Gewicht + lock
+  $weight_unlocked = !empty($_POST['vds_weight_unlocked']) && $_POST['vds_weight_unlocked'] === '1';
+  $weight_input    = isset($_POST['vds_total_weight']) ? floatval($_POST['vds_total_weight']) : 0;
+
+  if (!$pickup)  $pickup  = VDS_DEFAULT_PICKUP_WINDOW;
+  if (!$deliver) $deliver = 'ASAP';
+
+  update_post_meta($order_id, '_vds_packaging_type',   $type);
+  update_post_meta($order_id, '_vds_packaging_qty',    $qty);
+  update_post_meta($order_id, '_vds_packaging_other',  $other);
+  update_post_meta($order_id, '_vds_pickup_window',    $pickup);
+  update_post_meta($order_id, '_vds_delivery_date',    $deliver);
+  update_post_meta($order_id, '_vds_note_inpakker',    $note_p);
+  update_post_meta($order_id, '_vds_note_tgv',         $note_t);
+  update_post_meta($order_id, '_vds_send_inpakker',    $send_p ? 1 : 0);
+  update_post_meta($order_id, '_vds_send_tgv',         $send_t ? 1 : 0);
+
+  if ($weight_unlocked && $weight_input > 0) {
+    update_post_meta($order_id, '_vds_weight_override', $weight_input);
+    update_post_meta($order_id, '_vds_weight_unlocked', 1);
+  } else {
+    delete_post_meta($order_id, '_vds_weight_override');
+    update_post_meta($order_id, '_vds_weight_unlocked', 0);
+  }
+
+  // NEW: carrier label opslaan (kan leeg zijn = auto)
+  if ($carrier_label_input !== '') {
+    update_post_meta($order_id, '_vds_carrier_label', $carrier_label_input);
+  } else {
+    delete_post_meta($order_id, '_vds_carrier_label');
+  }
+
+  $order = wc_get_order($order_id);
+  if (!$order) return;
+
+  // NEW: pickup bepalen (Afhalen in Hardenberg of geen methode)
+  $is_pickup = vds_is_pickup_order($order);
+
+  // Bij pickup TGV altijd uit
+  if ($is_pickup) {
+    $send_t = false;
+    update_post_meta($order_id, '_vds_send_tgv', 0);
+  }
+
+  $summary    = vds_build_packaging_summary($type, $qty, $other);
+  $items      = vds_build_items_array($order);
+
+  // Gewicht voor payload: override of automatisch
+  $auto_weight     = vds_calc_total_weight_kg($order);
+  $weight_override = get_post_meta($order_id, '_vds_weight_override', true);
+  $weight          = ($weight_override !== '' && $weight_override !== null)
+                      ? floatval($weight_override)
+                      : $auto_weight;
+
+  $ship       = vds_extract_shipping_block($order);
+  $contact    = vds_extract_contact($order);
+  $order_url  = admin_url('post.php?post='.$order_id.'&action=edit');
+  $cust_note  = (string) $order->get_customer_note();
+
+  $country = $order->get_shipping_country();
+  if (!$country) $country = $order->get_billing_country();
+  $ship['country'] = $country;
+
+  // Opmerkingen voor WhatsApp / templates: nooit leeg -> '-'
+  $note_p_payload = ($note_p !== '' ? $note_p : '-');
+  $note_t_payload = ($note_t !== '' ? $note_t : '-');
+  $cust_note_payload = ($cust_note !== '' ? $cust_note : '-');
+
+  // NEW: definitief carrier_label voor payload
+  $carrier_override = get_post_meta($order_id, '_vds_carrier_label', true);
+  $carrier_label = $carrier_override !== ''
+    ? $carrier_override
+    : ($is_pickup ? 'Wordt afgehaald door klant' : 'TGV');
+
+  /* 1) Genereer/refresh pakbon (laatste versie) */
+  vds_generate_or_refresh_packing_slip($order);
+
+  /* 2) Download-URL's voor payload */
+  $packing_slip = [
+    'filename'    => 'pakbon-'.$order->get_order_number().'.pdf',
+    'mime'        => 'application/pdf',
+    'wc_rest_url' => vds_get_wc_rest_packing_slip_url($order),
+    'proxy_url'   => vds_get_packing_slip_proxy_url($order),
+  ];
+
+  // INPAKKER
+  if ($send_p && !vds_order_has_lock($order, 'inpakker')) {
+    $payload_p = [
+      'topic'            => 'inpakker',
+      'source'           => 'vds-packbon',
+      'order_id'         => $order_id,
+      'order_number'     => $order->get_order_number(),
+      'packaging'        => $summary,
+      'packaging_qty'    => (int) $qty,
+      'packaging_other'  => $other,
+      'pickup_window'    => $pickup,
+      'delivery_date'    => $deliver,
+      'note_inpakker'    => $note_p_payload,
+      'note_tgv'         => $note_t_payload,
+      'customer_note'    => $cust_note_payload,
+      'total_weight_kg'  => $weight,
+      'shipping'         => $ship,
+      'contact'          => $contact,
+      'items'            => $items,
+      'packing_slip'     => $packing_slip,
+      'order_admin_url'  => $order_url,
+
+      // NEW:
+      'is_pickup'        => $is_pickup ? 1 : 0,
+      'packaging_label'  => $summary,
+      'carrier_label'    => $carrier_label,
+    ];
+    $ok = vds_post_json(VDS_WEBHOOK_DISPATCH, $payload_p);
+    if ($ok) { $order->add_order_note('Pakbon inpakker verstuurd. '.VDS_LOCK_INPAKKER); update_post_meta($order_id, '_vds_send_inpakker', 0); }
+    else     { $order->add_order_note('FOUT: versturen naar inpakker mislukt (zie log).'); }
+  } elseif ($send_p) {
+    $order->add_order_note('Versturen naar inpakker overgeslagen: lock actief.');
+    update_post_meta($order_id, '_vds_send_inpakker', 0);
+  }
+
+  // TGV
+  if ($send_t && !vds_order_has_lock($order, 'tgv')) {
+    $payload_t = [
+      'topic'            => 'tgv',
+      'source'           => 'vds-packbon',
+      'order_id'         => $order_id,
+      'order_number'     => $order->get_order_number(),
+      'packaging'        => $summary,
+      'packaging_qty'    => (int) $qty,
+      'packaging_other'  => $other,
+      'pickup_window'    => $pickup,
+      'delivery_date'    => $deliver,
+      'note_tgv'         => $note_t_payload,
+      'note_inpakker'    => $note_p_payload,
+      'customer_note'    => $cust_note_payload,
+      'total_weight_kg'  => $weight,
+      'shipping'         => $ship,
+      'contact'          => $contact,
+      'items'            => $items,
+      'packing_slip'     => $packing_slip,
+      'order_admin_url'  => $order_url,
+
+      // NEW:
+      'is_pickup'        => $is_pickup ? 1 : 0,
+      'packaging_label'  => $summary,
+      'carrier_label'    => $carrier_label,
+    ];
+    $ok = vds_post_json(VDS_WEBHOOK_DISPATCH, $payload_t);
+    if ($ok) { $order->add_order_note('Pakbon TGV verstuurd. '.VDS_LOCK_TGV); update_post_meta($order_id, '_vds_send_tgv', 0); }
+    else     { $order->add_order_note('FOUT: versturen naar TGV mislukt (zie log).'); }
+  } elseif ($send_t) {
+    $order->add_order_note('Versturen naar TGV overgeslagen: lock actief.');
+    update_post_meta($order_id, '_vds_send_tgv', 0);
+  }
+}, 20);
+
+/* === Helpers === */
+function vds_build_packaging_summary($type, $qty, $other) {
+  $options = vds_packaging_options();
+  $label = isset($options[$type]) ? $options[$type] : 'onbekend';
+  if ($type === 'anders' && $other) $label = $other;
+  return trim($label . ($qty > 1 ? ' x' . $qty : ''));
+}
+
+function vds_build_items_array(WC_Order $order) {
+  $out = [];
+  foreach ($order->get_items() as $item) {
+    $product = $item->get_product();
+    $out[] = [
+      'name'     => $item->get_name(),
+      'sku'      => $product ? $product->get_sku() : '',
+      'qty'      => (int) $item->get_quantity(),
+      'weight_kg'=> $product ? floatval($product->get_weight()) : 0,
+    ];
+  }
+  return $out;
+}
+
+function vds_calc_total_weight_kg(WC_Order $order) {
+  $kg = 0;
+  foreach ($order->get_items() as $item) {
+    $product = $item->get_product();
+    if ($product) $kg += floatval($product->get_weight()) * (int)$item->get_quantity();
+  }
+  return round($kg, 2);
+}
+
+function vds_extract_shipping_block(WC_Order $order) {
+  return [
+    'company'  => $order->get_shipping_company(),
+    'name'     => trim($order->get_shipping_first_name().' '.$order->get_shipping_last_name()),
+    'address1' => $order->get_shipping_address_1(),
+    'address2' => $order->get_shipping_address_2(),
+    'postcode' => $order->get_shipping_postcode(),
+    'city'     => $order->get_shipping_city(),
+    'state'    => $order->get_shipping_state(),
+    'country'  => $order->get_shipping_country(),
+  ];
+}
+
+function vds_extract_contact(WC_Order $order) {
+  return [
+    'phone' => $order->get_billing_phone(),
+    'email' => $order->get_billing_email(),
+  ];
+}
+
+// NEW: bepaal of order een afhaalorder is
+function vds_is_pickup_order(WC_Order $order) {
+  $methods = $order->get_shipping_methods();
+
+  // Geen verzendmethode -> behandelen als afhalen
+  if (empty($methods)) {
+    return true;
+  }
+
+  foreach ($methods as $item) {
+    $title = method_exists($item, 'get_method_title') ? $item->get_method_title() : '';
+    if ($title && stripos($title, 'Afhalen in Hardenberg') !== false) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function vds_post_json($url, $payload) {
+  $args = [
+    'timeout' => 25,
+    'headers' => ['Content-Type' => 'application/json; charset=utf-8'],
+    'body'    => wp_json_encode($payload),
+  ];
+  $resp = wp_remote_post($url, $args);
+  if (is_wp_error($resp)) { if (VDS_DISPATCH_DEBUG) error_log('[VDS Dispatch] HTTP error: '. $resp->get_error_message()); return false; }
+  $code = wp_remote_retrieve_response_code($resp);
+  if (VDS_DISPATCH_DEBUG) error_log('[VDS Dispatch] POST '.$url.' -> '.$code.' | '. wp_remote_retrieve_body($resp));
+  return $code >= 200 && $code < 300;
+}
+
+/* === Genereer/refresh pakbon via plugin API === */
+function vds_generate_or_refresh_packing_slip(WC_Order $order){
+  if (!function_exists('wcpdf_get_document')) return;
+  try {
+    $doc = wcpdf_get_document('packing-slip', $order);
+    if ($doc && method_exists($doc, 'get_pdf')) $doc->get_pdf();
+  } catch (\Throwable $e) {
+    if (VDS_DISPATCH_DEBUG) error_log('[VDS PackingSlip GEN] '.$e->getMessage());
+  }
+}
+
+/* === WC REST download-URL (zonder auth; voor clients die Basic Auth instellen) === */
+function vds_get_wc_rest_packing_slip_url(WC_Order $order){
+  $id = $order->get_id();
+  return add_query_arg(['type'=>'packing-slip','generate'=>'true'], home_url("/wp-json/wc/v3/orders/{$id}/documents"));
+}
+
+/* === PDF PROXY (HMAC) — server-side fetch via WC REST met Basic Auth CK:CS === */
+add_action('rest_api_init', function() {
+
+  $callback = function($req) {
+    $order_id = (int) $req['order_id'];
+    $sig      = (string) $req['sig'];
+    if (!$order_id) { status_header(400); echo 'Bad request'; exit; }
+
+    $expected = sha1($order_id . VDS_PDF_SECRET);
+    if (!hash_equals($expected, $sig)) { status_header(401); echo 'Unauthorized'; exit; }
+
+    $download_url = add_query_arg([
+      'type'     => 'packing-slip',
+      'generate' => 'true',
+    ], home_url("/wp-json/wc/v3/orders/{$order_id}/documents"));
+
+    $auth = base64_encode(VDS_WC_CK . ':' . VDS_WC_CS);
+
+    $resp = wp_remote_get($download_url, [
+      'timeout'      => 45,
+      'redirection'  => 5,
+      'headers'      => [
+        'Authorization' => 'Basic ' . $auth,
+        'Accept'        => 'application/pdf,application/octet-stream',
+        'User-Agent'    => 'VDS-PDF-Proxy/2.3',
+      ],
+      'sslverify'    => true,
+    ]);
+
+    if (is_wp_error($resp)) {
+      status_header(502); echo 'Upstream error: '.$resp->get_error_message(); exit;
+    }
+
+    $code = wp_remote_retrieve_response_code($resp);
+    $body = wp_remote_retrieve_body($resp);
+
+    if ($code !== 200 || empty($body)) {
+      status_header(502);
+      echo 'Upstream status '.$code.'; body-len='.strlen((string)$body);
+      exit;
+    }
+
+    if (substr($body, 0, 5) !== "%PDF-") {
+      if (defined('VDS_DISPATCH_DEBUG') && VDS_DISPATCH_DEBUG) {
+        error_log('[VDS Proxy] Body does not start with %PDF-; len='.strlen($body));
+      }
+    }
+
+    if (function_exists('ini_set')) @ini_set('zlib.output_compression', 'Off');
+
+    // default: pakbon-ORDERID.pdf
+    $filename = 'pakbon-'.$order_id.'.pdf';
+
+    // als er een bestandsnaam in de URL zit, gebruik die
+    if (!empty($req['filename'])) {
+      $safe = basename((string)$req['filename']);
+      if ($safe) $filename = $safe;
+    }
+
+    nocache_headers();
+    header('Content-Type: application/pdf');
+    header('Content-Disposition: inline; filename="'.$filename.'"');
+    header('Content-Transfer-Encoding: binary');
+    header('Accept-Ranges: none');
+    header('Content-Length: '.strlen($body));
+
+    echo $body;
+    exit;
+  };
+
+  // route zonder expliciete filename (oude stijl)
+  register_rest_route('vds/v1', '/packing-slip/(?P<order_id>\d+)/(?P<sig>[a-f0-9]{40})', [
+    'methods'  => 'GET',
+    'permission_callback' => '__return_true',
+    'callback' => $callback,
+  ]);
+
+  // route mét filename aan het eind (nieuwe stijl voor WhatsApp)
+  register_rest_route('vds/v1', '/packing-slip/(?P<order_id>\d+)/(?P<sig>[a-f0-9]{40})/(?P<filename>[^/]+)', [
+    'methods'  => 'GET',
+    'permission_callback' => '__return_true',
+    'callback' => $callback,
+  ]);
+});
+
+
+/* === Proxy-URL helper (HMAC) === */
+function vds_get_packing_slip_proxy_url(WC_Order $order){
+  $id        = $order->get_id();
+  $sig       = sha1($id . VDS_PDF_SECRET);
+  $filename  = 'pakbon-'.$order->get_order_number().'.pdf';
+  $filename  = rawurlencode($filename); // veilig in de URL
+
+  return home_url("/wp-json/vds/v1/packing-slip/{$id}/{$sig}/{$filename}");
+}
+
+/* === Locks & kolom === */
+function vds_order_has_lock(WC_Order $order, $topic) {
+  $order_id = $order->get_id();
+  if (vds_order_notes_contain($order_id, VDS_LOCK_ALL)) return true;
+  if ($topic === 'inpakker') return vds_order_notes_contain($order_id, VDS_LOCK_INPAKKER);
+  if ($topic === 'tgv')      return vds_order_notes_contain($order_id, VDS_LOCK_TGV);
+  if ($topic === 'all')      return vds_order_notes_contain($order_id, VDS_LOCK_ALL);
+  return false;
+}
+function vds_order_notes_contain($order_id, $needle) {
+  $notes = wc_get_order_notes(['order_id' => $order_id, 'type' => 'internal', 'limit' => 100]);
+  foreach ($notes as $n) if (!empty($n->content) && stripos($n->content, $needle) !== false) return true;
+  return false;
+}
+add_filter('manage_edit-shop_order_columns', function($columns){ $columns['vds_dispatch'] = 'Verpakking'; return $columns; });
+add_action('manage_shop_order_posts_custom_column', function($column, $post_id){
+  if ($column !== 'vds_dispatch') return;
+  $type  = get_post_meta($post_id, '_vds_packaging_type', true);
+  $qty   = get_post_meta($post_id, '_vds_packaging_qty', true);
+  $other = get_post_meta($post_id, '_vds_packaging_other', true);
+  $label = vds_build_packaging_summary($type, $qty ?: 1, $other);
+  echo esc_html($label ?: '-');
+}, 10, 2);
