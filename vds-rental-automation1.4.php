@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: VDS Rental Automation (MU)
- * Description: Verhuur-WhatsApp & Trustpilot via Zapier met server-side planning, locks en robuuste betaaldetectie.
+ * Description: Verhuur-WhatsApp via Zapier met server-side planning, locks en robuuste betaaldetectie.
  * Version:     1.2.0
  */
 
@@ -914,7 +914,7 @@ function vds_zap($topic, WC_Order $order, array $extra=[]){
   if (vds_is_partner_phone($order->get_billing_phone())) return;
 
   $payload = array_merge([
-    'topic'         => $topic,  // whatsapp.payment_ok_delivery / whatsapp.install_success / review.invite / ...
+    'topic'         => $topic,  // whatsapp.payment_ok_delivery / whatsapp.install_success / ...
     'order_id'      => $order->get_id(),
     'order_number'  => method_exists($order,'get_order_number') ? $order->get_order_number() : (string)$order->get_id(),
     'status'        => $order->get_status(),
@@ -1037,7 +1037,7 @@ add_action('woocommerce_order_status_changed', function($order_id, $old, $new){
     return;
   }
 
-  if (!in_array($new, ['leveren-ophalen','huur-afhalen','verhuur-afgerond','verzonden-tgv','afgehaald','huur-betal-ontv'], true)) return;
+  if (!in_array($new, ['leveren-ophalen','huur-afhalen','verhuur-afgerond','huur-betal-ontv'], true)) return;
 
   vds_log('status_changed', [
     'order' => $order_id,
@@ -1069,13 +1069,10 @@ if (!vds_order_contains_rental($order)) {
     return;
   }
 
-  // B) Review/Trustpilot (inclusief extra WhatsApp bij 'verhuur-afgerond')
-  if (in_array($new, ['verzonden-tgv','verhuur-afgerond','afgehaald'], true)) {
-    if (vds_lock_once($order, 'review_'.$new)) {
-      vds_zap('review.invite', $order, ['reason'=>$new]);
-      if ($new === 'verhuur-afgerond' && vds_lock_once($order, 'review_whatsapp_'.$new)) {
-        vds_zap('whatsapp.review_after_rental', $order, ['reason'=>$new]);
-      }
+  // B) Extra WhatsApp na afronden verhuur
+  if (in_array($new, ['verhuur-afgerond'], true)) {
+     if ($new === 'verhuur-afgerond' && vds_lock_once($order, 'review_whatsapp_'.$new)) {
+      vds_zap('whatsapp.review_after_rental', $order, ['reason'=>$new]);
     }
     return;
   }
